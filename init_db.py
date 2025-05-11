@@ -1,4 +1,4 @@
-from app import app, db, User, Account
+from app import app, db, User, Account, CategoryMapping
 from werkzeug.security import generate_password_hash
 
 # Create tables
