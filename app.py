@@ -7,6 +7,7 @@ from functools import wraps
 from werkzeug.security import generate_password_hash, check_password_hash
 import csv
 import io
+import traceback
 
 # Load environment variables
 load_dotenv()
@@ -50,8 +51,8 @@ class UploadedFile(db.Model):
 
 class Transaction(db.Model):
     id = db.Column(db.Integer, primary_key=True)
-    posted_date = db.Column(db.Date, nullable=False)
-    posted_account = db.Column(db.String(100), nullable=False)
+    posted_date = db.Column(db.Date, nullable=True)  # Changed to nullable
+    posted_account = db.Column(db.String(100), nullable=True)  # Changed to nullable
     description1 = db.Column(db.String(500))
     description2 = db.Column(db.String(500))
     description3 = db.Column(db.String(500))
@@ -67,7 +68,7 @@ class Transaction(db.Model):
     def to_dict(self):
         return {
             'id': self.id,
-            'posted_date': self.posted_date.strftime('%Y-%m-%d'),
+            'posted_date': self.posted_date.strftime('%Y-%m-%d') if self.posted_date else None,
             'posted_account': self.posted_account,
             'description1': self.description1,
             'description2': self.description2,
@@ -79,6 +80,31 @@ class Transaction(db.Model):
             'category': self.category,
             'created_at': self.created_at.strftime('%Y-%m-%d %H:%M:%S')
         }
+
+# Parse date with multiple possible formats
+def parse_date(date_str):
+    if not date_str or date_str.strip() == '':
+        return None
+        
+    date_formats = [
+        '%Y-%m-%d',   # 2023-01-15
+        '%d/%m/%Y',   # 15/01/2023
+        '%m/%d/%Y',   # 01/15/2023
+        '%d-%m-%Y',   # 15-01-2023
+        '%d-%b-%Y',   # 15-Jan-2023
+        '%d %b %Y',   # 15 Jan 2023
+        '%b %d, %Y',  # Jan 15, 2023
+        '%d.%m.%Y',   # 15.01.2023
+        '%Y/%m/%d'    # 2023/01/15
+    ]
+    
+    for fmt in date_formats:
+        try:
+            return datetime.strptime(date_str, fmt).date()
+        except ValueError:
+            continue
+    
+    return None
 
 # Login required decorator
 def login_required(f):
@@ -176,39 +202,145 @@ def upload_file():
     db.session.add(uploaded_file)
     db.session.commit()
     
-    # Process CSV file
-    csv_content = file.read().decode('utf-8')
-    csv_reader = csv.DictReader(io.StringIO(csv_content))
+    # Read and process CSV file
+    try:
+        # Process CSV file
+        csv_content = file.read().decode('utf-8')
+        csv_file = io.StringIO(csv_content)
+        
+        # Try to determine dialect
+        sample = csv_file.read(1024)
+        csv_file.seek(0)
+        sniffer = csv.Sniffer()
+        dialect = sniffer.sniff(sample)
+        has_header = sniffer.has_header(sample)
+        
+        transactions = []
+        
+        if has_header:
+            reader = csv.DictReader(csv_file, dialect=dialect)
+            for row in reader:
+                transactions.extend(process_row(row, uploaded_file.id, account_id))
+        else:
+            # If no header, fall back to default processing
+            reader = csv.reader(csv_file, dialect=dialect)
+            headers = next(reader, None)  # Skip first row
+            for row in reader:
+                row_dict = dict(zip(headers, row))
+                transactions.extend(process_row(row_dict, uploaded_file.id, account_id))
+        
+        if transactions:
+            db.session.add_all(transactions)
+            db.session.commit()
+        
+        return jsonify({
+            'message': 'File uploaded successfully', 
+            'file_id': uploaded_file.id,
+            'transactions_count': len(transactions)
+        })
     
+    except Exception as e:
+        db.session.rollback()
+        app.logger.error(f"Error processing CSV: {str(e)}")
+        app.logger.error(traceback.format_exc())
+        return jsonify({'error': f'Error processing CSV: {str(e)}'}), 500
+
+def process_row(row, file_id, account_id):
+    """Process a CSV row and return one or more Transaction objects"""
     transactions = []
-    for row in csv_reader:
-        try:
-            transaction = Transaction(
-                posted_date=datetime.strptime(row.get('Posted Date', ''), '%Y-%m-%d'),
-                posted_account=row.get('Posted Account', ''),
-                description1=row.get('Transaction Description', ''),
-                description2=row.get('Description2', ''),
-                description3=row.get('Description3', ''),
-                debit_amount=float(row.get('Debit Amount', 0) or 0),
-                credit_amount=float(row.get('Credit Amount', 0) or 0),
-                balance=float(row.get('Balance', 0) or 0),
-                transaction_type=row.get('Transaction Type', ''),
-                file_id=uploaded_file.id,
-                account_id=account_id
-            )
-            transactions.append(transaction)
-        except Exception as e:
-            print(f"Error processing row: {e}")
     
-    if transactions:
-        db.session.add_all(transactions)
-        db.session.commit()
+    # Log the column names we received
+    app.logger.info(f"CSV columns: {list(row.keys())}")
     
-    return jsonify({
-        'message': 'File uploaded successfully', 
-        'file_id': uploaded_file.id,
-        'transactions_count': len(transactions)
-    })
+    try:
+        # Attempt to normalize column names
+        normalized_row = {}
+        for key, value in row.items():
+            if key:  # Skip empty keys
+                normalized_key = key.lower().strip().replace(' ', '_')
+                normalized_row[normalized_key] = value
+        
+        # Create a mapping for common column names
+        date_fields = ['date', 'posted_date', 'transaction_date', 'posting_date']
+        account_fields = ['account', 'posted_account', 'account_number']
+        description_fields = ['description', 'transaction_description', 'details', 'narrative']
+        debit_fields = ['debit', 'debit_amount', 'withdrawal', 'amount_out']
+        credit_fields = ['credit', 'credit_amount', 'deposit', 'amount_in']
+        balance_fields = ['balance', 'running_balance', 'current_balance']
+        
+        # Extract values using potential column names
+        date_str = find_first_value(normalized_row, date_fields)
+        account_name = find_first_value(normalized_row, account_fields)
+        description = find_first_value(normalized_row, description_fields)
+        
+        debit_str = find_first_value(normalized_row, debit_fields)
+        credit_str = find_first_value(normalized_row, credit_fields)
+        balance_str = find_first_value(normalized_row, balance_fields)
+        
+        # Handle case where there's a single amount column with positive/negative values
+        amount_str = find_first_value(normalized_row, ['amount', 'value', 'transaction_amount'])
+        if amount_str and not (debit_str or credit_str):
+            try:
+                amount = float(amount_str.replace(',', ''))
+                if amount < 0:
+                    debit_str = str(abs(amount))
+                    credit_str = '0'
+                else:
+                    credit_str = str(amount)
+                    debit_str = '0'
+            except (ValueError, TypeError):
+                pass
+        
+        # Parse numerical values
+        debit_amount = parse_float(debit_str)
+        credit_amount = parse_float(credit_str)
+        balance = parse_float(balance_str)
+        
+        # Create the transaction
+        transaction = Transaction(
+            posted_date=parse_date(date_str),
+            posted_account=account_name,
+            description1=description,
+            description2=row.get('Description2', ''),
+            description3=row.get('Description3', ''),
+            debit_amount=debit_amount,
+            credit_amount=credit_amount,
+            balance=balance,
+            transaction_type=row.get('Transaction Type', ''),
+            file_id=file_id,
+            account_id=account_id
+        )
+        transactions.append(transaction)
+        
+    except Exception as e:
+        app.logger.error(f"Error processing row: {str(e)}")
+        app.logger.error(f"Row data: {row}")
+    
+    return transactions
+
+def find_first_value(row_dict, possible_keys):
+    """Find the first non-empty value from a list of possible keys"""
+    for key in possible_keys:
+        for col in row_dict:
+            if key in col.lower():
+                value = row_dict[col]
+                if value and value.strip():
+                    return value
+    return None
+
+def parse_float(value_str):
+    """Parse a string to float, handling various formats"""
+    if not value_str or not isinstance(value_str, str):
+        return 0.0
+    
+    # Remove currency symbols, commas, etc.
+    clean_value = value_str.replace('$', '').replace('£', '').replace('€', '').replace(',', '')
+    clean_value = clean_value.replace('(', '-').replace(')', '')
+    
+    try:
+        return float(clean_value)
+    except (ValueError, TypeError):
+        return 0.0
 
 @app.route('/transactions', methods=['GET'])
 @login_required
