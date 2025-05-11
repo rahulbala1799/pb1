@@ -8,6 +8,9 @@ from werkzeug.security import generate_password_hash, check_password_hash
 import csv
 import io
 import traceback
+import json
+from collections import Counter
+import re
 
 # Load environment variables
 load_dotenv()
@@ -26,12 +29,28 @@ app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'your-secret-key-here')
 # Initialize SQLAlchemy
 db = SQLAlchemy(app)
 
+# Define available categories
+CATEGORIES = [
+    "Living Expense",
+    "Luxury",
+    "Food",
+    "Rent",
+    "Holiday",
+    "Saving",
+    "Investment",
+    "Loan Payment",
+    "Credit Card Payment",
+    "Business Expense",
+    "Uncategorized"
+]
+
 # Models
 class User(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     username = db.Column(db.String(80), unique=True, nullable=False)
     password_hash = db.Column(db.String(200), nullable=False)
     accounts = db.relationship('Account', backref='owner', lazy=True)
+    category_mappings = db.relationship('CategoryMapping', backref='user', lazy=True)
 
 class Account(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -51,16 +70,16 @@ class UploadedFile(db.Model):
 
 class Transaction(db.Model):
     id = db.Column(db.Integer, primary_key=True)
-    posted_date = db.Column(db.Date, nullable=True)  # Changed to nullable
-    posted_account = db.Column(db.String(100), nullable=True)  # Changed to nullable
+    posted_date = db.Column(db.Date, nullable=True)
+    posted_account = db.Column(db.String(100), nullable=True)
     description1 = db.Column(db.String(500))
     description2 = db.Column(db.String(500))
     description3 = db.Column(db.String(500))
     debit_amount = db.Column(db.Float)
     credit_amount = db.Column(db.Float)
     balance = db.Column(db.Float)
-    transaction_type = db.Column(db.String(50))  # posted currency, local currency
-    category = db.Column(db.String(100))
+    transaction_type = db.Column(db.String(50))
+    category = db.Column(db.String(100), default="Uncategorized")
     file_id = db.Column(db.Integer, db.ForeignKey('uploaded_file.id'), nullable=False)
     account_id = db.Column(db.Integer, db.ForeignKey('account.id'), nullable=False)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
@@ -80,6 +99,18 @@ class Transaction(db.Model):
             'category': self.category,
             'created_at': self.created_at.strftime('%Y-%m-%d %H:%M:%S')
         }
+
+class CategoryMapping(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    keyword = db.Column(db.String(255), nullable=False)
+    category = db.Column(db.String(100), nullable=False)
+    count = db.Column(db.Integer, default=1)
+    last_used = db.Column(db.DateTime, default=datetime.utcnow)
+    
+    __table_args__ = (
+        db.UniqueConstraint('user_id', 'keyword', name='unique_user_keyword'),
+    )
 
 # Parse date with multiple possible formats
 def parse_date(date_str):
@@ -229,6 +260,12 @@ def upload_file():
                 row_dict = dict(zip(headers, row))
                 transactions.extend(process_row(row_dict, uploaded_file.id, account_id))
         
+        # Apply category suggestions to new transactions
+        for transaction in transactions:
+            suggested_category = suggest_category(transaction.description1, session['user_id'])
+            if suggested_category:
+                transaction.category = suggested_category
+        
         if transactions:
             db.session.add_all(transactions)
             db.session.commit()
@@ -342,6 +379,40 @@ def parse_float(value_str):
     except (ValueError, TypeError):
         return 0.0
 
+def extract_keywords(description):
+    """Extract meaningful keywords from transaction description"""
+    if not description:
+        return []
+    
+    # Remove special characters and convert to lowercase
+    clean_desc = re.sub(r'[^\w\s]', ' ', description.lower())
+    
+    # Split into words and remove common words and numbers
+    words = [word for word in clean_desc.split() if len(word) > 2 and not word.isdigit()]
+    
+    return words
+
+def suggest_category(description, user_id):
+    """Suggest a category based on transaction description and user's past categorizations"""
+    if not description:
+        return None
+    
+    keywords = extract_keywords(description)
+    if not keywords:
+        return None
+    
+    # Check if any keywords match existing mappings
+    for keyword in keywords:
+        mapping = CategoryMapping.query.filter_by(
+            user_id=user_id, 
+            keyword=keyword
+        ).order_by(CategoryMapping.count.desc()).first()
+        
+        if mapping:
+            return mapping.category
+    
+    return None
+
 @app.route('/transactions', methods=['GET'])
 @login_required
 def get_transactions():
@@ -355,6 +426,170 @@ def get_transactions():
     
     transactions = Transaction.query.filter_by(account_id=account_id).order_by(Transaction.posted_date.desc()).limit(100).all()
     return jsonify([t.to_dict() for t in transactions])
+
+@app.route('/transaction/<int:transaction_id>/category', methods=['PUT'])
+@login_required
+def update_transaction_category(transaction_id):
+    transaction = Transaction.query.get_or_404(transaction_id)
+    
+    # Check if transaction belongs to user
+    account = Account.query.get_or_404(transaction.account_id)
+    if account.user_id != session['user_id']:
+        return jsonify({'error': 'Unauthorized access to transaction'}), 403
+    
+    data = request.json
+    category = data.get('category')
+    
+    if not category or category not in CATEGORIES:
+        return jsonify({'error': 'Invalid category'}), 400
+    
+    # Update transaction category
+    transaction.category = category
+    
+    # Update category mapping for future suggestions
+    if transaction.description1:
+        keywords = extract_keywords(transaction.description1)
+        for keyword in keywords:
+            # Check if mapping exists
+            mapping = CategoryMapping.query.filter_by(
+                user_id=session['user_id'],
+                keyword=keyword
+            ).first()
+            
+            if mapping:
+                # Update existing mapping
+                if mapping.category == category:
+                    mapping.count += 1
+                    mapping.last_used = datetime.utcnow()
+                else:
+                    # If different category has higher count, create new mapping
+                    new_mapping = CategoryMapping(
+                        user_id=session['user_id'],
+                        keyword=keyword,
+                        category=category
+                    )
+                    db.session.add(new_mapping)
+            else:
+                # Create new mapping
+                new_mapping = CategoryMapping(
+                    user_id=session['user_id'],
+                    keyword=keyword,
+                    category=category
+                )
+                db.session.add(new_mapping)
+    
+    db.session.commit()
+    
+    return jsonify({'success': True, 'transaction': transaction.to_dict()})
+
+@app.route('/analysis')
+@login_required
+def analysis():
+    accounts = Account.query.filter_by(user_id=session['user_id']).all()
+    return render_template('analysis.html', accounts=accounts, categories=CATEGORIES)
+
+@app.route('/api/analysis/spending-by-category', methods=['GET'])
+@login_required
+def spending_by_category():
+    account_id = request.args.get('account_id')
+    start_date = request.args.get('start_date')
+    end_date = request.args.get('end_date')
+    
+    if not account_id:
+        return jsonify({'error': 'Account ID is required'}), 400
+    
+    account = Account.query.filter_by(id=account_id, user_id=session['user_id']).first()
+    if not account:
+        return jsonify({'error': 'Invalid account ID'}), 400
+    
+    query = Transaction.query.filter_by(account_id=account_id)
+    
+    if start_date:
+        try:
+            start_date = datetime.strptime(start_date, '%Y-%m-%d').date()
+            query = query.filter(Transaction.posted_date >= start_date)
+        except ValueError:
+            pass
+    
+    if end_date:
+        try:
+            end_date = datetime.strptime(end_date, '%Y-%m-%d').date()
+            query = query.filter(Transaction.posted_date <= end_date)
+        except ValueError:
+            pass
+    
+    transactions = query.all()
+    
+    # Calculate spending by category
+    category_spending = {}
+    for transaction in transactions:
+        category = transaction.category or "Uncategorized"
+        if category not in category_spending:
+            category_spending[category] = 0
+        
+        # Add debit amount (spending)
+        if transaction.debit_amount > 0:
+            category_spending[category] += transaction.debit_amount
+    
+    # Format for chart.js
+    labels = list(category_spending.keys())
+    data = [round(category_spending[label], 2) for label in labels]
+    
+    return jsonify({
+        'labels': labels,
+        'data': data
+    })
+
+@app.route('/api/analysis/monthly-spending', methods=['GET'])
+@login_required
+def monthly_spending():
+    account_id = request.args.get('account_id')
+    
+    if not account_id:
+        return jsonify({'error': 'Account ID is required'}), 400
+    
+    account = Account.query.filter_by(id=account_id, user_id=session['user_id']).first()
+    if not account:
+        return jsonify({'error': 'Invalid account ID'}), 400
+    
+    transactions = Transaction.query.filter_by(account_id=account_id).all()
+    
+    # Calculate monthly spending
+    monthly_data = {}
+    for transaction in transactions:
+        if not transaction.posted_date:
+            continue
+        
+        month_key = transaction.posted_date.strftime('%Y-%m')
+        if month_key not in monthly_data:
+            monthly_data[month_key] = {
+                'spending': 0,
+                'income': 0
+            }
+        
+        if transaction.debit_amount > 0:
+            monthly_data[month_key]['spending'] += transaction.debit_amount
+        
+        if transaction.credit_amount > 0:
+            monthly_data[month_key]['income'] += transaction.credit_amount
+    
+    # Convert to sorted list for chart
+    months = sorted(monthly_data.keys())
+    spending_data = [round(monthly_data[month]['spending'], 2) for month in months]
+    income_data = [round(monthly_data[month]['income'], 2) for month in months]
+    
+    # Format month labels
+    month_labels = []
+    for month in months:
+        year, month_num = month.split('-')
+        month_names = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+        month_labels.append(f"{month_names[int(month_num)-1]} {year}")
+    
+    return jsonify({
+        'labels': month_labels,
+        'spending': spending_data,
+        'income': income_data
+    })
 
 if __name__ == '__main__':
     with app.app_context():
