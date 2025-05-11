@@ -1,0 +1,12 @@
+ACC, Posted Transactions Date, Description, Debit Amount, Credit Amount,Balance,Transaction Type
+,,,,,,
+Loan3,28/04/2025,LN 93101240464424,,41.88,,Credit
+Loan3,28/04/2025,IE25042339859376,,0,-1905.02,Credit
+Loan3,28/03/2025,LN 93101240464424,,41.88,,Credit
+Loan3,28/03/2025,IE25032508651016,,0,-1946.9,Credit
+Loan3,18/03/2025,INTEREST CHARGED,30.66,,-1988.78,Debit
+Loan3,28/02/2025,LN 93101240464424,,41.88,,Credit
+Loan3,28/02/2025,IE25022033112064,,0,-1958.12,Credit
+Loan3,08/01/2025,Interest Rate,,0,,Credit
+Loan3,08/01/2025,Lending @  8.650%,,0,,Credit
+Loan3,08/01/2025,LN 93101240464424,2000,,-2000,Debit

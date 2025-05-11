@@ -5,6 +5,8 @@ import os
 from dotenv import load_dotenv
 from functools import wraps
 from werkzeug.security import generate_password_hash, check_password_hash
+import csv
+import io
 
 # Load environment variables
 load_dotenv()
@@ -28,34 +30,53 @@ class User(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     username = db.Column(db.String(80), unique=True, nullable=False)
     password_hash = db.Column(db.String(200), nullable=False)
+    accounts = db.relationship('Account', backref='owner', lazy=True)
+
+class Account(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(100), nullable=False)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    files = db.relationship('UploadedFile', backref='account', lazy=True)
+    transactions = db.relationship('Transaction', backref='account', lazy=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
 class UploadedFile(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     filename = db.Column(db.String(255), nullable=False)
     upload_date = db.Column(db.DateTime, default=datetime.utcnow)
+    account_id = db.Column(db.Integer, db.ForeignKey('account.id'), nullable=False)
     user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
     transactions = db.relationship('Transaction', backref='file', lazy=True)
 
 class Transaction(db.Model):
     id = db.Column(db.Integer, primary_key=True)
-    date = db.Column(db.Date, nullable=False)
-    description = db.Column(db.String(500), nullable=False)
-    amount = db.Column(db.Float, nullable=False)
-    category = db.Column(db.String(100))
-    transaction_type = db.Column(db.String(50))  # 'credit' or 'debit'
+    posted_date = db.Column(db.Date, nullable=False)
+    posted_account = db.Column(db.String(100), nullable=False)
+    description1 = db.Column(db.String(500))
+    description2 = db.Column(db.String(500))
+    description3 = db.Column(db.String(500))
+    debit_amount = db.Column(db.Float)
+    credit_amount = db.Column(db.Float)
     balance = db.Column(db.Float)
+    transaction_type = db.Column(db.String(50))  # posted currency, local currency
+    category = db.Column(db.String(100))
     file_id = db.Column(db.Integer, db.ForeignKey('uploaded_file.id'), nullable=False)
+    account_id = db.Column(db.Integer, db.ForeignKey('account.id'), nullable=False)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     
     def to_dict(self):
         return {
             'id': self.id,
-            'date': self.date.strftime('%Y-%m-%d'),
-            'description': self.description,
-            'amount': self.amount,
-            'category': self.category,
-            'transaction_type': self.transaction_type,
+            'posted_date': self.posted_date.strftime('%Y-%m-%d'),
+            'posted_account': self.posted_account,
+            'description1': self.description1,
+            'description2': self.description2,
+            'description3': self.description3,
+            'debit_amount': self.debit_amount,
+            'credit_amount': self.credit_amount,
             'balance': self.balance,
+            'transaction_type': self.transaction_type,
+            'category': self.category,
             'created_at': self.created_at.strftime('%Y-%m-%d %H:%M:%S')
         }
 
@@ -72,7 +93,8 @@ def login_required(f):
 @app.route('/')
 @login_required
 def index():
-    return render_template('index.html')
+    accounts = Account.query.filter_by(user_id=session['user_id']).all()
+    return render_template('index.html', accounts=accounts)
 
 @app.route('/login', methods=['GET', 'POST'])
 def login():
@@ -104,6 +126,25 @@ def logout():
     session.pop('user_id', None)
     return redirect(url_for('login'))
 
+@app.route('/accounts', methods=['GET'])
+@login_required
+def get_accounts():
+    accounts = Account.query.filter_by(user_id=session['user_id']).all()
+    return jsonify([{'id': a.id, 'name': a.name} for a in accounts])
+
+@app.route('/accounts', methods=['POST'])
+@login_required
+def create_account():
+    name = request.form.get('name')
+    if not name:
+        return jsonify({'error': 'Account name is required'}), 400
+    
+    account = Account(name=name, user_id=session['user_id'])
+    db.session.add(account)
+    db.session.commit()
+    
+    return jsonify({'message': 'Account created successfully', 'account_id': account.id})
+
 @app.route('/upload', methods=['POST'])
 @login_required
 def upload_file():
@@ -111,29 +152,77 @@ def upload_file():
         return jsonify({'error': 'No file provided'}), 400
     
     file = request.files['file']
+    account_id = request.form.get('account_id')
+    
     if file.filename == '':
         return jsonify({'error': 'No file selected'}), 400
     
     if not file.filename.endswith('.csv'):
         return jsonify({'error': 'Only CSV files are allowed'}), 400
     
+    if not account_id:
+        return jsonify({'error': 'Account ID is required'}), 400
+    
+    account = Account.query.filter_by(id=account_id, user_id=session['user_id']).first()
+    if not account:
+        return jsonify({'error': 'Invalid account ID'}), 400
+    
     # Save file details to database
     uploaded_file = UploadedFile(
         filename=file.filename,
+        account_id=account_id,
         user_id=session['user_id']
     )
     db.session.add(uploaded_file)
     db.session.commit()
     
-    return jsonify({'message': 'File uploaded successfully', 'file_id': uploaded_file.id})
+    # Process CSV file
+    csv_content = file.read().decode('utf-8')
+    csv_reader = csv.DictReader(io.StringIO(csv_content))
+    
+    transactions = []
+    for row in csv_reader:
+        try:
+            transaction = Transaction(
+                posted_date=datetime.strptime(row.get('Posted Date', ''), '%Y-%m-%d'),
+                posted_account=row.get('Posted Account', ''),
+                description1=row.get('Transaction Description', ''),
+                description2=row.get('Description2', ''),
+                description3=row.get('Description3', ''),
+                debit_amount=float(row.get('Debit Amount', 0) or 0),
+                credit_amount=float(row.get('Credit Amount', 0) or 0),
+                balance=float(row.get('Balance', 0) or 0),
+                transaction_type=row.get('Transaction Type', ''),
+                file_id=uploaded_file.id,
+                account_id=account_id
+            )
+            transactions.append(transaction)
+        except Exception as e:
+            print(f"Error processing row: {e}")
+    
+    if transactions:
+        db.session.add_all(transactions)
+        db.session.commit()
+    
+    return jsonify({
+        'message': 'File uploaded successfully', 
+        'file_id': uploaded_file.id,
+        'transactions_count': len(transactions)
+    })
 
-@app.route('/test-db')
-def test_db():
-    try:
-        db.session.execute('SELECT 1')
-        return jsonify({'status': 'success', 'message': 'Database connection successful!'})
-    except Exception as e:
-        return jsonify({'status': 'error', 'message': str(e)}), 500
+@app.route('/transactions', methods=['GET'])
+@login_required
+def get_transactions():
+    account_id = request.args.get('account_id')
+    if not account_id:
+        return jsonify({'error': 'Account ID is required'}), 400
+    
+    account = Account.query.filter_by(id=account_id, user_id=session['user_id']).first()
+    if not account:
+        return jsonify({'error': 'Invalid account ID'}), 400
+    
+    transactions = Transaction.query.filter_by(account_id=account_id).order_by(Transaction.posted_date.desc()).limit(100).all()
+    return jsonify([t.to_dict() for t in transactions])
 
 if __name__ == '__main__':
     with app.app_context():
