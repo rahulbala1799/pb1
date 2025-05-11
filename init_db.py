@@ -19,13 +19,14 @@ with app.app_context():
     # Create default accounts
     print("Creating default accounts...")
     accounts = [
-        "Current Account",
-        "Savings Account",
-        "Credit Card",
-        "Investment Account",
-        "Retirement Account",
-        "Business Account",
-        "Loan Account"
+        "Rahul Main",
+        "Ann Main",
+        "Ran Finn",
+        "Platinum",
+        "Click",
+        "Loan 1",
+        "Loan 2",
+        "Loan 3"
     ]
     
     for account_name in accounts:
